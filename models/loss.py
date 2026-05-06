@@ -9,7 +9,6 @@ def compute_cosine_similarity(x, y, eps=1e-8):
     y_n = F.normalize(y, p=2, dim=1, eps=eps)
     return torch.matmul(x_n, y_n.T)
 
-
 def unified_alignment_loss(
         mode,  # ["sem", "recg", "sage", "sage_no_sa", "sage_no_id", "sage_no_adagen"]
         projected_embeddings,
@@ -20,14 +19,15 @@ def unified_alignment_loss(
         lambda_g=0.001,
         gamma_g=1.0,
         beta_id=0.01,
-        tau=0.1
+        tau=0.1,
+        sim_threshold=0.0,  # 【新增】SIC 相似度阈值
 ):
     device = projected_embeddings.device
 
     # === 1. SEM 基线：无任何对齐约束 ===
     if mode == "sem":
         zero_tensor = torch.tensor(0.0, device=device)
-        return torch.tensor(0.0, device=device, requires_grad=True), zero_tensor, zero_tensor, lambda_g
+        return torch.tensor(0.0, device=device, requires_grad=True), zero_tensor, zero_tensor, torch.tensor(float(lambda_g), device=device)
 
     # === 2. RECG 基线：完全复刻 old 版本的交叉熵逻辑 ===
     if mode == "recg":
@@ -67,7 +67,8 @@ def unified_alignment_loss(
 
         # old logic: loss = -alpha_base * intra_diversity + beta * standard_inter_entropy
         l_gen = -lambda_g * intra_diversity + beta * standard_inter_entropy
-        return l_gen, standard_inter_entropy.detach(), intra_diversity.detach(), lambda_g
+        return l_gen, standard_inter_entropy.detach(), intra_diversity.detach(), torch.tensor(float(lambda_g), device=device)
+
 
     # === 3. SAGE 及其消融变体（二进制 Source vs Target 对齐） ===
     source_mask = (domain_labels == source_domain_id)
@@ -96,23 +97,29 @@ def unified_alignment_loss(
         if mode == "sage_no_sa":
             l_sic = dist_sq.mean()
         else:
-            w_ij = F.relu(compute_cosine_similarity(e_raw_s, e_raw_t))
+            sim_ij = compute_cosine_similarity(e_raw_s, e_raw_t)
+            w_ij = F.relu(sim_ij - sim_threshold)
             l_sic = torch.sum(w_ij * dist_sq) / (torch.sum(w_ij) + 1e-8)
 
     # --- 3.3 Domain-Adaptive Weighting (omega) ---
     if mode == "sage_no_adagen":
-        omega = lambda_g
+        omega = torch.tensor(float(lambda_g), device=device)
     else:
-        e_bar_s = e_raw_s.mean(dim=0, keepdim=True) if e_raw_s.size(0) > 0 else torch.zeros(1, raw_embeddings.size(1),
-                                                                                            device=device)
-        e_bar_t = e_raw_t.mean(dim=0, keepdim=True) if e_raw_t.size(0) > 0 else torch.zeros(1, raw_embeddings.size(1),
-                                                                                            device=device)
+        e_bar_s = e_raw_s.mean(dim=0, keepdim=True) if e_raw_s.size(0) > 0 else torch.zeros(
+            1, raw_embeddings.size(1), device=device
+        )
+        e_bar_t = e_raw_t.mean(dim=0, keepdim=True) if e_raw_t.size(0) > 0 else torch.zeros(
+            1, raw_embeddings.size(1), device=device
+        )
 
         e_bar_s = F.normalize(e_bar_s, p=2, dim=1)
         e_bar_t = F.normalize(e_bar_t, p=2, dim=1)
         delta = torch.norm(e_bar_s - e_bar_t, p=2)
-        omega = lambda_g * math.exp(-gamma_g * delta.item())
+
+        # 【修改】不使用 delta.item()，避免每个 batch GPU-CPU 同步。
+        # omega 本身不需要梯度，所以 detach 即可。
+        omega = torch.tensor(float(lambda_g), device=device) * torch.exp(-float(gamma_g) * delta.detach())
 
     # --- 3.4 Final Gen Loss ---
-    l_gen = l_sic + beta_id * l_id
+    l_gen = l_sic - beta_id * l_id
     return l_gen, l_sic.detach(), l_id.detach(), omega

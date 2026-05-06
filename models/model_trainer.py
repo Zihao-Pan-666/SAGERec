@@ -26,6 +26,10 @@ def ndcg_at_k(pred_items, ground_truth, k):
         return float(1.0 / np.log2(rank + 1))
     return 0.0
 
+def _to_float(x):
+    if torch.is_tensor(x):
+        return float(x.detach().cpu().item())
+    return float(x)
 
 def _sample_training_negatives_fast(
         train_seq: torch.Tensor, pos_items: torch.Tensor, num_items: int,
@@ -136,6 +140,12 @@ def train_sagerec_model(
         total_loss = total_bpr = total_gen = total_sic = total_id = total_omega = 0.0
         start_time = time.time()
 
+        total_align_time = 0.0
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+
         with tqdm(dataloader, desc=f"Epoch {epoch:02d}/{num_epochs}", leave=False, dynamic_ncols=True) as pbar:
             for step, batch in enumerate(pbar, start=1):
                 if isinstance(batch, (tuple, list)):
@@ -157,25 +167,36 @@ def train_sagerec_model(
                 neg_logits = logits.gather(1, neg_items)
                 rec_loss = bpr_loss(pos_logits.reshape(-1), neg_logits.reshape(-1))
 
-                # 3. 动态提取跨域辅助特征 (限制为 batch_size，防止计算灾难)
-                aux_data = aux_sampler.sample(device)
-                batch_size = seq.size(0)
-                sampled_embeddings = aux_data["aux_raw"][:batch_size]
-                sampled_domains = aux_data["aux_domain_ids"][:batch_size]
+                # 3. 动态提取跨域辅助特征
+                # 【修改】sem 模式完全跳过辅助域采样，避免效率实验被污染。
+                if not is_sem:
+                    aux_data = aux_sampler.sample(device)
+                    batch_size = seq.size(0)
+                    sampled_embeddings = aux_data["aux_raw"][:batch_size]
+                    sampled_domains = aux_data["aux_domain_ids"][:batch_size]
+                else:
+                    sampled_embeddings = torch.empty(0, device=device)
+                    sampled_domains = torch.empty(0, dtype=torch.long, device=device)
 
-                # 【核心修复】：还原对“整个历史序列”的提取，找回真实的 Alpha 尺度！
+                # 提取当前 batch 中出现过的 source item
                 source_items = torch.unique(torch.cat([seq.reshape(-1), pos], dim=0))
-                source_item_ids = source_items[source_items > 0]  # 过滤掉 padding 0
+                source_item_ids = source_items[source_items > 0]
 
                 if not is_sem and source_item_ids.numel() > 0 and sampled_embeddings.numel() > 0:
-                    # 只有在非 sem 模式才进行投影和对齐计算
+                    align_t0 = time.time()
+
                     source_projected = model.project_items_for_alignment(source_item_ids)
                     source_sem_raw = model.get_raw_item_embeddings(source_item_ids)
-                    source_domain_labels = torch.full((source_item_ids.size(0),), current_domain_id, dtype=torch.long,
-                                                      device=device)
+                    source_domain_labels = torch.full(
+                        (source_item_ids.size(0),),
+                        current_domain_id,
+                        dtype=torch.long,
+                        device=device
+                    )
 
-                    all_projected = torch.cat([source_projected, model.project_raw_for_alignment(sampled_embeddings)],
-                                              dim=0)
+                    aux_projected = model.project_raw_for_alignment(sampled_embeddings)
+
+                    all_projected = torch.cat([source_projected, aux_projected], dim=0)
                     all_raw = torch.cat([source_sem_raw, sampled_embeddings], dim=0)
                     all_domains = torch.cat([source_domain_labels, sampled_domains], dim=0)
 
@@ -189,15 +210,18 @@ def train_sagerec_model(
                         lambda_g=args.lambda_g,
                         gamma_g=args.gamma_g,
                         beta_id=args.beta_id,
-                        tau=args.tau
+                        tau=args.tau,
+                        sim_threshold=getattr(args, "sim_threshold", 0.0),
                     )
+
+                    total_align_time += time.time() - align_t0
+
                 else:
-                    # 【关键修复】：将 0.0 改为 tensor(0.0)，防止后续 .item() 报错
                     gen_loss, sic_val, id_val, omega_val = (
                         torch.tensor(0.0, device=device, requires_grad=True),
                         torch.tensor(0.0, device=device),
                         torch.tensor(0.0, device=device),
-                        args.lambda_g
+                        torch.tensor(float(args.lambda_g), device=device)
                     )
 
                 loss = rec_loss + omega_val * gen_loss
@@ -207,12 +231,15 @@ def train_sagerec_model(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
 
+                omega_float = _to_float(omega_val)
+
                 total_loss += loss.item()
                 total_bpr += rec_loss.item()
                 total_gen += gen_loss.item()
                 total_sic += sic_val.item()
                 total_id += id_val.item()
-                total_omega += omega_val
+                total_omega += omega_float
+
                 pbar.set_postfix({
                     'Loss': f"{total_loss/step:.4f}",
                     'BPR': f"{total_bpr/step:.4f}",
@@ -225,9 +252,19 @@ def train_sagerec_model(
         elapsed = time.time() - start_time
         steps = len(dataloader)
         avg_loss = total_loss / steps
-        tqdm.write(f"Epoch {epoch:02d} | Loss: {avg_loss:.4f} | BPR: {total_bpr / steps:.4f} | "
-                   f"Gen: {total_gen / steps:.4f} | SIC: {total_sic / steps:.4f} | "
-                   f"ID: {total_id/step:.4f} | Omega: {total_omega/step:.5f} | Time: {elapsed:.1f}s")
+        peak_epoch_mem = (
+            torch.cuda.max_memory_allocated() / 1024 / 1024
+            if torch.cuda.is_available()
+            else 0.0
+        )
+
+        tqdm.write(
+            f"Epoch {epoch:02d} | Loss: {avg_loss:.4f} | BPR: {total_bpr / steps:.4f} | "
+            f"Gen: {total_gen / steps:.4f} | SIC: {total_sic / steps:.4f} | "
+            f"ID: {total_id / steps:.4f} | Omega: {total_omega / steps:.5f} | "
+            f"Time: {elapsed:.1f}s | AlignTime: {total_align_time:.2f}s | "
+            f"PeakMem: {peak_epoch_mem:.2f}MB"
+        )
 
         # if epoch % 25 == 0:
         #     periodic_path = model_save_path.replace(".pth", f"_{epoch}.pth")
@@ -279,8 +316,22 @@ def train_sagerec_model(
     return saved_paths
 
 
-def evaluate_model_with_neg_sampling(model, dataloader, top_k_set, num_items, device, num_negatives=100,
-                                     is_target_domain=False, is_sem_baseline=False):
+def evaluate_model_with_neg_sampling(
+        model, dataloader, top_k_set, num_items, device,
+        num_negatives=100,
+        is_target_domain=False,
+        is_sem_baseline=False,
+        fixed_eval_candidates=False,
+        eval_candidate_seed=2026,
+        eval_candidate_dir="",
+        dataset_name="",
+):
+
+    if fixed_eval_candidates:
+        rng = random.Random(eval_candidate_seed)
+    else:
+        rng = random
+
     # 与之前相同，不需要改动
     model.eval()
     recall_sum = {k: 0.0 for k in top_k_set}
@@ -315,16 +366,28 @@ def evaluate_model_with_neg_sampling(model, dataloader, top_k_set, num_items, de
             train_val_history = torch.cat([train_seq, val_item.unsqueeze(1)], dim=1).cpu().numpy()
 
             for i in range(batch_size):
-                history_set = set(train_val_history[i])
-                history_set.discard(0)
+                ground_truth = int(test_item_np[i])
 
-                # 随机快速抽样
+                blocked_set = set(int(x) for x in train_val_history[i] if int(x) != 0)
+                # 【关键修复】测试正样本不能被采为负样本
+                blocked_set.add(ground_truth)
+
+                if num_items - len(blocked_set) < num_negatives:
+                    raise ValueError(
+                        f"Not enough negative items: num_items={num_items}, "
+                        f"blocked={len(blocked_set)}, required={num_negatives}"
+                    )
+
                 neg_samples = []
+                neg_set = set()
+
                 while len(neg_samples) < num_negatives:
-                    sample = random.randint(1, num_items)
-                    if sample not in history_set:
+                    sample = rng.randint(1, num_items)
+                    if sample not in blocked_set and sample not in neg_set:
                         neg_samples.append(sample)
-                candidate_list.append(neg_samples + [int(test_item_np[i])])
+                        neg_set.add(sample)
+
+                candidate_list.append(neg_samples + [ground_truth])
 
             candidate_tensor = torch.tensor(candidate_list, dtype=torch.long, device=device)  # [B, 101]
 

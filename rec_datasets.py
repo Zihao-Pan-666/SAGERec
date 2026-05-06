@@ -142,19 +142,31 @@ def load_domain_semantic_embeddings(
         parquet_name: Optional[str] = None,
         item_id_col: str = "ItemId",
         emb_col: str = "item_text_embedding",
+        embedding_tag: str = "llama",
+        embedding_path_template: str = "",
 ):
     """
     Load one domain's precomputed semantic embeddings from parquet.
-    Returns:
-      item_ids: torch.LongTensor [N]
-      raw_embs: torch.FloatTensor [N, D0]
-    """
-    if parquet_name is None:
-        parquet_name = f"{domain_name}_embedding_llama.parquet"
 
-    p = Path(data_root) / domain_name / parquet_name
+    【修改目的】
+    1. 支持 --embedding_tag llama / bert / sbert / title_only 等实验设置。
+    2. 避免做 encoder comparison 时，主域用了 BERT，但辅助域误加载 Llama。
+    3. 如果目标文件不存在，直接报错，防止静默 fallback 造成实验污染。
+    """
+    if parquet_name is not None:
+        p = Path(data_root) / domain_name / parquet_name
+    elif embedding_path_template:
+        # 允许主函数传入模板，例如:
+        # "./data/{domain}/{domain}_embedding_{tag}.parquet"
+        p = Path(embedding_path_template.format(domain=domain_name, tag=embedding_tag))
+    else:
+        p = Path(data_root) / domain_name / f"{domain_name}_embedding_{embedding_tag}.parquet"
+
     if not p.exists():
-        raise FileNotFoundError(f"Parquet not found: {p}")
+        raise FileNotFoundError(
+            f"Parquet not found: {p}\n"
+            f"Please check --embedding_tag={embedding_tag}, or provide parquet_name_map / embedding_path_template."
+        )
 
     df = pd.read_parquet(p)
     if item_id_col not in df.columns:
@@ -167,6 +179,7 @@ def load_domain_semantic_embeddings(
         np.stack(df[emb_col].apply(_parse_embedding_cell).values),
         dtype=torch.float32
     )
+
     return item_ids, raw_embs
 
 
@@ -190,6 +203,9 @@ class AuxiliarySemanticSampler:
             emb_col: str = "item_text_embedding",
             sample_mode: str = "domain_uniform",  # "domain_uniform" or "global_uniform"
             verbose: bool = True,
+            embedding_tag="llama",
+            embedding_path_template="",
+
     ):
         self.model = model
         self.aux_domains = aux_domains
@@ -201,6 +217,9 @@ class AuxiliarySemanticSampler:
         self.sample_mode = sample_mode
 
         self.domain_cache = []
+        self.embedding_tag = embedding_tag
+        self.embedding_path_template = embedding_path_template
+
         # each element: dict(name, item_ids, raw_embs, domain_id)
 
         for did, dname in enumerate(self.aux_domains):
@@ -211,6 +230,8 @@ class AuxiliarySemanticSampler:
                 parquet_name=parquet_name,
                 item_id_col=self.item_id_col,
                 emb_col=self.emb_col,
+                embedding_tag=self.embedding_tag,
+                embedding_path_template=self.embedding_path_template,
             )
             actual_domain_id = all_domains_for_index.index(dname) if all_domains_for_index else did
             self.domain_cache.append({
@@ -270,15 +291,14 @@ class AuxiliarySemanticSampler:
             aux_raw = raws[sel].to(device)
             aux_domain_ids = torch.full((aux_ids.shape[0],), did, dtype=torch.long, device=device)
 
-            aux_projected = self.model.project_raw_for_alignment(aux_raw)
-
             return {
                 "aux_raw": aux_raw,
-                "aux_projected": aux_projected,
+                # 【修改】不要在 sampler 中投影，训练器会在有梯度路径下统一投影。
                 "aux_ids": aux_ids,
                 "aux_domain_ids": aux_domain_ids,
                 "aux_domain_name": dname
             }
+
 
         elif self.sample_mode == "global_uniform":
             ids = self._global_ids
@@ -290,11 +310,11 @@ class AuxiliarySemanticSampler:
             aux_raw = raws[sel].to(device)
             aux_domain_ids = doms[sel].to(device)
 
-            aux_projected = self.model.project_raw_for_alignment(aux_raw)
+            # aux_projected = self.model.project_raw_for_alignment(aux_raw)
 
             return {
                 "aux_raw": aux_raw,
-                "aux_projected": aux_projected,
+                # "aux_projected": aux_projected,
                 "aux_ids": aux_ids,
                 "aux_domain_ids": aux_domain_ids,
                 "aux_domain_name": "mixed"
