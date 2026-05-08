@@ -158,7 +158,13 @@ def load_domain_semantic_embeddings(
     elif embedding_path_template:
         # 允许主函数传入模板，例如:
         # "./data/{domain}/{domain}_embedding_{tag}.parquet"
-        p = Path(embedding_path_template.format(domain=domain_name, tag=embedding_tag))
+        p = Path(
+            embedding_path_template.format(
+                data_root=data_root,
+                domain=domain_name,
+                tag=embedding_tag,
+            )
+        )
     else:
         p = Path(data_root) / domain_name / f"{domain_name}_embedding_{embedding_tag}.parquet"
 

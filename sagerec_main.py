@@ -76,7 +76,7 @@ def parse_args():
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--dropout_rate", type=float, default=0.2)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=2026)
 
@@ -105,11 +105,19 @@ def parse_args():
     parser.add_argument(
         "--target_domains",
         type=str,
-        default="",
+        default="amazon_cds_and_vinyl,steam",
         help=(
             "Comma-separated zero-shot evaluation target domains. "
             "If empty, all auxiliary domains are evaluated."
         )
+    )
+
+    parser.add_argument(
+        "--aux_sample_mode",
+        type=str,
+        default="domain_uniform",
+        choices=["domain_uniform", "global_uniform"],
+        help="Auxiliary sampling mode. Use domain_uniform for DAG analysis."
     )
 
     # -------------------------
@@ -153,6 +161,12 @@ def parse_args():
         help="Use old short checkpoint names. Not recommended for parameter sweeps."
     )
 
+    parser.add_argument(
+        "--disable_tqdm",
+        action="store_true",
+        help="Disable tqdm progress bars. Recommended for batch experiments and log files."
+    )
+
     # -------------------------
     # loss 模式
     # -------------------------
@@ -169,9 +183,9 @@ def parse_args():
     parser.add_argument("--early_stop_patience", type=int, default=10)
     parser.add_argument("--early_stop_criterion", type=str, default="zero_shot",
                         choices=["loss", "zero_shot"])
-    parser.add_argument("--check_step", type=int, default=3,
+    parser.add_argument("--check_step", type=int, default=1,
                         help="Evaluate every N epochs.")
-    parser.add_argument("--warmup_epochs", type=int, default=5,
+    parser.add_argument("--warmup_epochs", type=int, default=1,
                         help="Skip zero-shot eval for first N epochs.")
     parser.add_argument("--eval_only", action="store_true",
                         help="Skip training and only run evaluation.")
@@ -211,6 +225,27 @@ def parse_args():
         help=(
             "Similarity threshold for SIC. Requires models/loss.py to read "
             "args.sim_threshold or accept sim_threshold in unified_alignment_loss."
+        )
+    )
+
+    parser.add_argument(
+        "--sage_id_sign",
+        type=str,
+        default="minus",
+        choices=["minus", "plus"],
+        help=(
+            "Audit option for SAGERec. "
+            "minus: L_gen = L_SIC - beta*H_ID, consistent with diversity maximization. "
+            "plus: L_gen = L_SIC + beta*H_ID, used only to audit previous results."
+        )
+    )
+
+    parser.add_argument(
+        "--use_seq_pattern_eval",
+        action="store_true",
+        help=(
+            "Enable sequence-level pattern aggregation during target-domain evaluation. "
+            "This is required for full LLM-RecG reproduction."
         )
     )
 
@@ -343,9 +378,24 @@ def collect_source_train_sequences(dataset, device):
     return torch.cat(train_sequences, dim=0).to(device)
 
 
-def maybe_extract_source_patterns(model, source_train_sequences: torch.Tensor, loss_mode: str) -> None:
-    if loss_mode != "sem" and hasattr(model, "extract_sequential_patterns_from_source"):
+def maybe_extract_source_patterns(
+        model,
+        source_train_sequences: torch.Tensor,
+        loss_mode: str,
+        use_seq_pattern_eval: bool = False,
+) -> None:
+    """
+    只有显式启用 sequence-level pattern evaluation 时才提取 source patterns。
+    当前主实验和超参数搜索均不使用 SG，因此跳过该步骤可以显著节省时间，
+    且不会改变 no-SG 结果。
+    """
+    if (
+        use_seq_pattern_eval
+        and loss_mode != "sem"
+        and hasattr(model, "extract_sequential_patterns_from_source")
+    ):
         model.extract_sequential_patterns_from_source(source_train_sequences)
+
 
 
 def summarize_eval_result(result_dict: Dict[str, Dict[str, float]]) -> str:
@@ -399,6 +449,10 @@ def evaluate_with_optional_args(
         kwargs["eval_candidate_dir"] = args.eval_candidate_dir
     if "dataset_name" in sig.parameters:
         kwargs["dataset_name"] = dataset_name
+    if "disable_tqdm" in sig.parameters:
+        kwargs["disable_tqdm"] = getattr(args, "disable_tqdm", False)
+    if "use_seq_pattern_eval" in sig.parameters:
+        kwargs["use_seq_pattern_eval"] = getattr(args, "use_seq_pattern_eval", False)
 
     return evaluate_model_with_neg_sampling(**kwargs)
 
@@ -420,7 +474,12 @@ def build_zero_shot_eval_fn(
 ):
     def zero_shot_eval_fn(model, target_domains: List[str]) -> Dict[str, Dict[str, float]]:
         model.eval()
-        maybe_extract_source_patterns(model, source_train_sequences, args.loss_mode)
+        maybe_extract_source_patterns(
+            model,
+            source_train_sequences,
+            args.loss_mode,
+            getattr(args, "use_seq_pattern_eval", False),
+        )
 
         results = {}
         with torch.no_grad():
@@ -445,16 +504,26 @@ def build_zero_shot_eval_fn(
 
         model.load_new_pretrain_embeddings(source_embeddings)
 
+        # 【修复】先固定 target 结果列表，再计算 avg。
+        # 避免 results["avg"] 被加入 results.values() 后又参与自身均值计算。
         if results:
-            results["avg"] = {
-                f"R{k}": float(np.mean([v[f"R{k}"] for v in results.values()]))
-                for k in top_k_set
-            }
+            target_metric_dicts = list(results.values())
+
+            avg_metrics = {}
             for k in top_k_set:
-                results["avg"][f"N{k}"] = float(np.mean([v[f"N{k}"] for v in results.values()]))
+                avg_metrics[f"R{k}"] = float(
+                    np.mean([v[f"R{k}"] for v in target_metric_dicts if f"R{k}" in v])
+                )
+                avg_metrics[f"N{k}"] = float(
+                    np.mean([v[f"N{k}"] for v in target_metric_dicts if f"N{k}" in v])
+                )
+
+            results["avg"] = avg_metrics
         else:
-            results["avg"] = {f"R{k}": 0.0 for k in top_k_set}
-            results["avg"].update({f"N{k}": 0.0 for k in top_k_set})
+            results["avg"] = {}
+            for k in top_k_set:
+                results["avg"][f"R{k}"] = 0.0
+                results["avg"][f"N{k}"] = 0.0
 
         return results
 
@@ -567,6 +636,7 @@ def append_results_csv(
         "embedding_tag", "batch_size", "lambda_g", "gamma_g", "beta_id",
         "tau", "sim_threshold", "seed", "eval_num_negatives",
         "fixed_eval_candidates", "eval_candidate_seed", "peak_gpu_mem_mb",
+        "sage_id_sign", "use_seq_pattern_eval",
     ]
 
     metric_fields = sorted({
@@ -605,6 +675,8 @@ def append_results_csv(
                 "fixed_eval_candidates": int(args.fixed_eval_candidates),
                 "eval_candidate_seed": args.eval_candidate_seed,
                 "peak_gpu_mem_mb": peak_gpu_mem_mb,
+                "sage_id_sign": getattr(args, "sage_id_sign", "minus"),
+                "use_seq_pattern_eval": int(getattr(args, "use_seq_pattern_eval", False)),
             }
             row.update(metrics)
             writer.writerow(row)
@@ -619,13 +691,13 @@ def try_structural_eval(args, model, target_loader, target_dataset, device, targ
     if not args.eval_structural:
         return {}
 
-    try:
-        from structural_metrics import evaluate_full_catalog_structural
-    except Exception as exc:
-        logger.warning(
-            f"[STRUCTURAL] structural_metrics.py not available. Skip Coverage/ILD. Error: {exc}"
-        )
-        return {}
+    # try:
+    #     from structural_metrics import evaluate_full_catalog_structural
+    # except Exception as exc:
+    #     logger.warning(
+    #         f"[STRUCTURAL] structural_metrics.py not available. Skip Coverage/ILD. Error: {exc}"
+    #     )
+    #     return {}
 
     try:
         coverage, ild = evaluate_full_catalog_structural(
@@ -691,7 +763,7 @@ def main():
     target_names = domain_config["target_domains"]
     current_domain_id = all_domains.index(args.dataset_name)
 
-    logger.info("Initializing AuxiliarySemanticSampler for dynamic global sampling...")
+    # logger.info("Initializing AuxiliarySemanticSampler for dynamic global sampling...")
 
     # 【修改 10】Sampler 参数兼容层：
     # 如果你后续在 rec_datasets.AuxiliarySemanticSampler 中新增 embedding_tag /
@@ -702,7 +774,7 @@ def main():
         all_domains_for_index=all_domains,
         data_root=args.data_root,
         aux_batch_size=args.num_samples,
-        sample_mode="domain_uniform",
+        sample_mode=args.aux_sample_mode,
         verbose=True,
     )
     sampler_sig = inspect.signature(AuxiliarySemanticSampler)
@@ -711,7 +783,12 @@ def main():
     if "embedding_path_template" in sampler_sig.parameters:
         sampler_kwargs["embedding_path_template"] = args.embedding_path_template
 
-    aux_sampler = AuxiliarySemanticSampler(**sampler_kwargs)
+    if args.loss_mode == "sem":
+        logger.info("Skip AuxiliarySemanticSampler because loss_mode=sem.")
+        aux_sampler = None
+    else:
+        logger.info("Initializing AuxiliarySemanticSampler for dynamic global sampling...")
+        aux_sampler = AuxiliarySemanticSampler(**sampler_kwargs)
 
     source_train_sequences = collect_source_train_sequences(source_dataset, device)
 
@@ -805,7 +882,12 @@ def main():
             logger.warning(f"Checkpoint not found for Zero-Shot eval: {target_ckpt}")
             continue
 
-        maybe_extract_source_patterns(model, source_train_sequences, args.loss_mode)
+        maybe_extract_source_patterns(
+            model,
+            source_train_sequences,
+            args.loss_mode,
+            getattr(args, "use_seq_pattern_eval", False),
+        )
 
         target_dataset = initialize_dataset(target_name, args.max_len, args.data_root)
         target_embs = load_embeddings(target_name, args)

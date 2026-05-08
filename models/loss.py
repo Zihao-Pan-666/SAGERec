@@ -21,6 +21,7 @@ def unified_alignment_loss(
         beta_id=0.01,
         tau=0.1,
         sim_threshold=0.0,  # 【新增】SIC 相似度阈值
+        sage_id_sign="minus",
 ):
     device = projected_embeddings.device
 
@@ -121,5 +122,11 @@ def unified_alignment_loss(
         omega = torch.tensor(float(lambda_g), device=device) * torch.exp(-float(gamma_g) * delta.detach())
 
     # --- 3.4 Final Gen Loss ---
-    l_gen = l_sic - beta_id * l_id
+    if sage_id_sign == "minus":
+        l_gen = l_sic - beta_id * l_id
+    elif sage_id_sign == "plus":
+        l_gen = l_sic + beta_id * l_id
+    else:
+        raise ValueError(f"Unsupported sage_id_sign: {sage_id_sign}")
+
     return l_gen, l_sic.detach(), l_id.detach(), omega

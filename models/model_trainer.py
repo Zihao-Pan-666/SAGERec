@@ -145,8 +145,15 @@ def train_sagerec_model(
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
+        disable_tqdm = getattr(args, "disable_tqdm", False)
 
-        with tqdm(dataloader, desc=f"Epoch {epoch:02d}/{num_epochs}", leave=False, dynamic_ncols=True) as pbar:
+        with tqdm(
+                dataloader,
+                desc=f"Epoch {epoch:02d}/{num_epochs}",
+                leave=False,
+                dynamic_ncols=True,
+                disable=disable_tqdm
+        ) as pbar:
             for step, batch in enumerate(pbar, start=1):
                 if isinstance(batch, (tuple, list)):
                     seq, pos, _ = batch
@@ -212,6 +219,7 @@ def train_sagerec_model(
                         beta_id=args.beta_id,
                         tau=args.tau,
                         sim_threshold=getattr(args, "sim_threshold", 0.0),
+                        sage_id_sign=getattr(args, "sage_id_sign", "minus"),
                     )
 
                     total_align_time += time.time() - align_t0
@@ -325,6 +333,8 @@ def evaluate_model_with_neg_sampling(
         eval_candidate_seed=2026,
         eval_candidate_dir="",
         dataset_name="",
+        disable_tqdm=False,
+        use_seq_pattern_eval=False,
 ):
 
     if fixed_eval_candidates:
@@ -338,7 +348,12 @@ def evaluate_model_with_neg_sampling(
     ndcg_sum = {k: 0.0 for k in top_k_set}
     total = 0
     domain_label = "Target" if is_target_domain else "Source"
-    pbar = tqdm(dataloader, desc=f"Eval [{domain_label}]", leave=False)
+    pbar = tqdm(
+        dataloader,
+        desc=f"Eval [{domain_label}]",
+        leave=False,
+        disable=disable_tqdm
+    )
 
     # 【优化点 1】：在循环外预计算全量物品的 Embedding，避免重复计算
     with torch.no_grad():
@@ -391,15 +406,43 @@ def evaluate_model_with_neg_sampling(
 
             candidate_tensor = torch.tensor(candidate_list, dtype=torch.long, device=device)  # [B, 101]
 
-            # 获取用户表征
-            # 注意：此处需微调模型代码，或直接调用模型内部编码逻辑
-            user_rep = model.encode_sequence(eval_seq, is_sem_baseline=is_sem_baseline)
+            use_sg_now = (
+                    use_seq_pattern_eval
+                    and is_target_domain
+                    and (not is_sem_baseline)
+            )
 
-            # 【优化点 3】：仅对候选物品进行打分（矩阵点乘优化）
-            # candidate_embs: [B, 101, H]
-            candidate_embs = all_item_embs[candidate_tensor]
-            # scores: [B, 101]
-            scores = (user_rep.unsqueeze(1) * candidate_embs).sum(dim=-1)
+            if use_sg_now:
+                # 【关键】走模型 forward / predict 路径，使 target-domain sequence-level pattern aggregation 生效。
+                # 优先使用 predict；如果模型没有 predict，则退回 forward + gather。
+                if hasattr(model, "predict"):
+                    try:
+                        scores = model.predict(
+                            eval_seq,
+                            candidate_items=candidate_tensor,
+                            is_target_domain=True,
+                            is_sem_baseline=is_sem_baseline,
+                        )
+                    except TypeError:
+                        # 兼容不同 predict 签名
+                        full_scores = model(
+                            eval_seq,
+                            is_target_domain=True,
+                            is_sem_baseline=is_sem_baseline,
+                        )
+                        scores = torch.gather(full_scores, 1, candidate_tensor)
+                else:
+                    full_scores = model(
+                        eval_seq,
+                        is_target_domain=True,
+                        is_sem_baseline=is_sem_baseline,
+                    )
+                    scores = torch.gather(full_scores, 1, candidate_tensor)
+            else:
+                # 原始路径：不使用 sequence-level pattern，只用 sequence encoder 表征打分
+                user_rep = model.encode_sequence(eval_seq, is_sem_baseline=is_sem_baseline)
+                candidate_embs = all_item_embs[candidate_tensor]
+                scores = (user_rep.unsqueeze(1) * candidate_embs).sum(dim=-1)
 
             _, top_indices = torch.topk(scores, k=max(top_k_set), dim=-1)
             top_k_items = torch.gather(candidate_tensor, 1, top_indices)
