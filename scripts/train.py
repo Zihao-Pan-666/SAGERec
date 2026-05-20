@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
 from sagerec.datasets import AuxiliarySemanticSampler, load_sequence_dataset
 from sagerec.models import build_model
@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument("--embedding_tag", type=str, default="llama")
     parser.add_argument("--embedding_path_template", type=str, default="")
 
-    parser.add_argument("--model", type=str, default="bert4rec", choices=["sasrec", "bert4rec", "gru4rec", "unisrec"])
+    parser.add_argument("--model", type=str, default="bert4rec", choices=["bert4rec", "sasrec", "gru4rec", "unisrec"])
     parser.add_argument("--loss_mode", type=str, default="sage", choices=["sem", "recg", "sage"])
     parser.add_argument("--hidden_units", type=int, default=256)
     parser.add_argument("--max_len", type=int, default=50)

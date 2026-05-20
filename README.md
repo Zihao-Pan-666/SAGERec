@@ -1,8 +1,11 @@
 # SAGERec
 
-SAGERec is a similarity-aware generalization framework for zero-shot cross-domain sequential recommendation. The model is trained on an interaction-rich source domain and directly transferred to unseen target domains without using target-domain interactions during training. Item-side text is encoded by an LLM encoder and used as transferable semantic information across domains.
+Implementation for **SAGERec: Similarity-Aware Generalization Framework for Zero-Shot Cross-Domain Sequential Recommendation**.
 
-The implementation supports four sequential recommendation backbones:
+SAGERec aims to improve zero-shot cross-domain sequential recommendation. The model is trained on a source domain and directly evaluated on unseen target domains. It uses LLM-based item semantic representations and a similarity-aware generalization objective to support transferable user behavior modeling across domains.
+
+The current implementation supports the following sequential recommendation backbones:
+
 
 - BERT4Rec
 - SASRec
@@ -11,90 +14,96 @@ The implementation supports four sequential recommendation backbones:
 
 It also supports three training objectives:
 
-- `sem`: semantic sequential recommendation without cross-domain regularization.
-- `recg`: semantic generalization baseline with alignment.
-- `sage`: the proposed similarity-aware and domain-adaptive generalization objective.
+- `sem`: semantic sequential recommendation baseline
+- `recg`: semantic generalization baseline
+- `sage`: the proposed similarity-aware generalization objective
 
-## Project structure
+---
 
-```text
-sagerec_release/
-├── README.md
-├── requirements.txt
-├── src/
-│   └── sagerec/
-│       ├── __init__.py
-│       ├── datasets.py
-│       ├── losses.py
-│       ├── models.py
-│       ├── trainer.py
-│       └── utils.py
-└── scripts/
-    ├── preprocess_amazon.py
-    ├── encode_items.py
-    └── train.py
-```
+## Requirements
 
-## Environment
+The experiments were conducted with Python 3.9+ and PyTorch 2.6.0. The local environment used the CUDA 12.6 build of PyTorch (`torch==2.6.0+cu126`). Please install the PyTorch version that matches your CUDA environment.
+
+Key packages:
+
+- `torch==2.6.0`
+- `transformers==4.40.2`
+- `datasets==3.1.0`
+- `evaluate==0.4.3`
+- `llm2vec==0.2.2`
+- `peft==0.11.1`
+- `accelerate==1.12.0`
+- `huggingface-hub==0.36.0 `
+- `tokenizers==0.19.1 `
+- `safetensors==0.7.0`
+- `numpy==2.0.2`
+- `pandas==2.2.3`
+- `pyarrow==23.0.0`
+- `scikit-learn==1.5.2`
+- `scipy==1.13.1`
+- `tqdm==4.66.5`
+
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-For item-text encoding, install `llm2vec` and the corresponding model dependencies required by your local environment.
+Run all scripts from the project root. If needed, set the Python path first:
 
-## Data format
-
-Each domain is placed under `data/<domain>/`.
-
-For training and evaluation, the required processed file is:
-
-```text
-data/<domain>/processed_data.csv
+```bash
+export PYTHONPATH=$PWD
 ```
 
-Required columns:
+---
+
+## Structure
 
 ```text
-UserId, ItemId, Timestamp
+SAGERec/
+├── sagerec/
+│   ├── __init__.py
+│   ├── datasets.py          # Dataset loading and sequence construction
+│   ├── losses.py            # Training objectives and regularization losses
+│   ├── models.py            # SASRec, BERT4Rec, GRU4Rec, and UniSRec backbones
+│   ├── trainer.py           # Training and evaluation loops
+│   └── utils.py             # Utility functions
+├── scripts/
+│   ├── preprocess_amazon.py # Amazon-style data preprocessing
+│   ├── encode_items.py      # LLM-based item text encoding
+│   └── train.py             # Training and zero-shot evaluation
+├── README.md
+└── requirements.txt
 ```
 
-Item-text columns used for LLM encoding include:
+---
+
+## Usage
+
+### 1. Data Preparation
+
+The raw Amazon review data used in the experiments can be obtained from **Amazon Reviews 2023**:
 
 ```text
-title, description, features
+https://amazon-reviews-2023.github.io/
 ```
 
-For Steam-style data, the encoder also supports:
+The dataset is also available on Hugging Face:
 
 ```text
-products, text
+https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023
 ```
 
-The generated item semantic embedding file should be:
+For each domain, download the corresponding review file and metadata file, then place them under `data/{domain}/`.
+
+The current preprocessing script expects the following local file names:
 
 ```text
-data/<domain>/<domain>_embedding_llama.parquet
+data/{domain}/{domain}.csv
+data/{domain}/meta_{domain}.jsonl
 ```
 
-with columns:
-
-```text
-ItemId, item_text_embedding
-```
-
-The model uses `0` as the padding index. Real item ids are mapped to the dense range `1..N` during dataset loading.
-
-## Preprocess Amazon-style datasets
-
-Raw files are expected under each domain directory:
-
-```text
-data/<domain>/<domain>.csv
-data/<domain>/meta_<domain>.jsonl
-```
-
-Run:
+Run preprocessing:
 
 ```bash
 python scripts/preprocess_amazon.py \
@@ -104,9 +113,37 @@ python scripts/preprocess_amazon.py \
   --max_seq_len 50
 ```
 
-The script applies 10-core filtering, aligns interactions with metadata, removes repeated user-item interactions, truncates user histories to the latest 50 interactions, and writes `processed_data.csv`.
+The processed data will be saved as:
 
-## Encode item text with LLM2Vec
+```text
+data/{domain}/processed_data.csv
+```
+
+The processed file should contain at least:
+
+```text
+UserId, ItemId, Timestamp
+```
+
+Item text fields such as `title`, `description`, and `features` are used for semantic item encoding when available.
+
+Due to storage and redistribution constraints, processed data files and pre-computed item embeddings are not included in this repository. They can be generated using the provided scripts. If you need the exact processed files used in the paper, please contact the authors.
+
+### 2. Item Semantic Encoding
+
+Generate item semantic embeddings with LLM2Vec. The default model can be downloaded directly from Hugging Face:
+
+```text
+McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp
+```
+
+If the model has already been downloaded locally, you can also pass the local model path to `--model_name`, for example:
+
+```text
+./llm2vec-llama-3-8B-Instruct-mntp
+```
+
+Run item encoding:
 
 ```bash
 python scripts/encode_items.py \
@@ -117,9 +154,19 @@ python scripts/encode_items.py \
   --batch_size 256
 ```
 
-This produces one parquet embedding file for each domain.
+This produces one embedding file for each domain:
 
-## Train SAGERec
+```text
+data/{domain}/{domain}_embedding_llama.parquet
+```
+
+The embedding file should contain:
+
+```text
+ItemId, item_text_embedding
+```
+
+### 3. Training and Zero-Shot Evaluation
 
 Example: train on Movies & TV and evaluate zero-shot transfer to CDs & Vinyl and Steam.
 
@@ -133,17 +180,31 @@ python scripts/train.py \
   --loss_mode sage \
   --epochs 100 \
   --batch_size 128 \
-  --hidden_units 256 \
-  --max_len 50 \
-  --num_heads 2 \
-  --num_layers 2 \
-  --dropout_rate 0.2 \
-  --learning_rate 1e-4 \
-  --lambda_g 0.05 \
-  --gamma_g 0.1 \
-  --beta_id 0.1 \
-  --tau 0.2 \
-  --sim_threshold 0.0
+  --learning_rate 1e-4
+```
+
+Available backbones:
+
+```bash
+--model bert4rec
+--model sasrec
+--model gru4rec
+--model unisrec
+```
+
+Available objectives:
+
+```bash
+--loss_mode sem
+--loss_mode recg
+--loss_mode sage
+```
+
+Evaluation uses sampled negative items and reports Recall and NDCG at the configured top-k values. By default, the script uses:
+
+```bash
+--topk 10,20
+--eval_negatives 100
 ```
 
 Results are saved to:
@@ -152,90 +213,14 @@ Results are saved to:
 outputs/results.csv
 ```
 
-The checkpoint is saved under:
+Model checkpoints are saved under:
 
 ```text
 outputs/checkpoints/
 ```
 
-## Run different backbones
-
-Use the `--model` option:
-
-```bash
---model sasrec
---model bert4rec
---model gru4rec
---model unisrec
-```
-
-For UniSRec, the number of MoE experts can be set by:
-
-```bash
---n_exps 8
-```
-
-## Run different objectives
-
-```bash
---loss_mode sem
---loss_mode recg
---loss_mode sage
-```
-
-A typical comparison can be launched as:
-
-```bash
-for model in sasrec bert4rec gru4rec unisrec
-do
-  for loss in sem recg sage
-  do
-    python scripts/train.py \
-      --data_root ./data \
-      --source_domain amazon_movies_and_tv \
-      --all_domains amazon_movies_and_tv,amazon_cds_and_vinyl,steam \
-      --target_domains amazon_cds_and_vinyl,steam \
-      --model $model \
-      --loss_mode $loss \
-      --epochs 100 \
-      --batch_size 128
-  done
-done
-```
-
-## Evaluation protocol
-
-For each target domain, the model is evaluated in a zero-shot manner. The target-domain interaction sequences are used only for evaluation, not for parameter optimization. The default evaluation uses sampled negative items and reports Recall and NDCG at the configured top-k values.
-
-Default top-k values:
-
-```bash
---topk 10,20
-```
-
-Default number of sampled negatives:
-
-```bash
---eval_negatives 100
-```
-
-## Main hyperparameters
-
-| Argument | Description | Default |
-|---|---|---:|
-| `--hidden_units` | Hidden dimension | 256 |
-| `--max_len` | Maximum sequence length | 50 |
-| `--num_heads` | Transformer attention heads | 2 |
-| `--num_layers` | Sequential encoder layers | 2 |
-| `--dropout_rate` | Dropout rate | 0.2 |
-| `--batch_size` | Training batch size | 128 |
-| `--learning_rate` | Learning rate | 1e-4 |
-| `--lambda_g` | Base semantic regularization strength | 0.05 |
-| `--gamma_g` | Domain-adaptive decay coefficient | 0.1 |
-| `--beta_id` | Intra-domain diversity weight | 0.1 |
-| `--tau` | Temperature for semantic regularization | 0.2 |
-| `--sim_threshold` | Similarity threshold for cross-domain item alignment | 0.0 |
+---
 
 ## Citation
 
-Please cite the corresponding SAGERec paper when using this code.
+If you use this code, please cite the corresponding SAGERec paper.

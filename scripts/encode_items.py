@@ -16,10 +16,11 @@ import torch
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
 try:
     from llm2vec import LLM2Vec
+    LLM2VEC_IMPORT_ERROR = None
 except ImportError as exc:
     LLM2Vec = None
     LLM2VEC_IMPORT_ERROR = exc
@@ -82,8 +83,14 @@ def join_field(items: List[str], fallback: str) -> str:
 
 def amazon_prompt(row: pd.Series) -> str:
     title = first_existing(row, ["title", "Title", "product_title", "products"]) or "no title provided"
-    description = join_field(parse_listish(first_existing(row, ["description", "Description", "desc", "text"])), "no description provided")
-    features = join_field(parse_listish(first_existing(row, ["features", "feature", "Feature", "categories"])), "no feature provided")
+    description = join_field(
+        parse_listish(first_existing(row, ["description", "Description", "desc", "text"])),
+        "no description provided",
+    )
+    features = join_field(
+        parse_listish(first_existing(row, ["features", "feature", "Feature", "categories"])),
+        "no feature provided",
+    )
     return f"Please summarize the following item: title: {title}. Feature: {features}. Description: {description}"
 
 
@@ -95,6 +102,9 @@ def steam_prompt(row: pd.Series) -> str:
 
 def build_item_table(domain: str, data_root: str, max_items: int = 0) -> pd.DataFrame:
     path = Path(data_root) / domain / "processed_data.csv"
+    if not path.exists():
+        raise FileNotFoundError(f"Processed data not found: {path}")
+
     df = pd.read_csv(path).drop_duplicates("ItemId").reset_index(drop=True)
     df = df.head(max_items) if max_items else df
 
@@ -104,25 +114,55 @@ def build_item_table(domain: str, data_root: str, max_items: int = 0) -> pd.Data
     else:
         df["prompt"] = df.apply(amazon_prompt, axis=1)
         df["ItemId"] = range(1, len(df) + 1)
+
     return df[["ItemId", "prompt"]]
 
 
-def encode_domain(args, domain: str) -> None:
+def parse_torch_dtype(dtype: str):
+    dtype = dtype.lower()
+    if dtype == "auto":
+        return None
+    if dtype == "float16":
+        return torch.float16
+    if dtype == "bfloat16":
+        return torch.bfloat16
+    if dtype == "float32":
+        return torch.float32
+    raise ValueError("--torch_dtype must be one of: auto, float16, bfloat16, float32")
+
+
+def load_encoder(args):
     if LLM2Vec is None:
         raise ImportError("llm2vec is not installed.") from LLM2VEC_IMPORT_ERROR
 
+    kwargs = {
+        "device_map": args.device,
+    }
+
+    torch_dtype = parse_torch_dtype(args.torch_dtype)
+    if torch_dtype is not None:
+        kwargs["torch_dtype"] = torch_dtype
+
+    if args.peft_model_name:
+        kwargs["peft_model_name_or_path"] = args.peft_model_name
+
+    return LLM2Vec.from_pretrained(args.model_name, **kwargs)
+
+
+def encode_domain(args, domain: str) -> None:
     output = Path(args.data_root) / domain / f"{domain}_embedding_{args.embedding_tag}.parquet"
     if output.exists() and not args.overwrite:
         print(f"{domain}: skip existing {output}")
         return
 
     item_table = build_item_table(domain, args.data_root, args.max_items_per_domain)
-    model = LLM2Vec.from_pretrained(args.model_name, device_map=args.device)
+    model = load_encoder(args)
 
     embeddings = []
-    start = time.time()
+    start_time = time.time()
+
     for start_idx in tqdm(range(0, len(item_table), args.batch_size), desc=f"Encoding {domain}"):
-        batch = item_table["prompt"].iloc[start_idx : start_idx + args.batch_size].tolist()
+        batch = item_table["prompt"].iloc[start_idx:start_idx + args.batch_size].tolist()
         emb = model.encode(batch)
         if isinstance(emb, torch.Tensor):
             emb = emb.detach().cpu().numpy()
@@ -133,17 +173,31 @@ def encode_domain(args, domain: str) -> None:
         "item_text_embedding": embeddings,
     })
     result.to_parquet(output, index=False)
-    print(f"{domain}: saved {len(result)} embeddings to {output} in {time.time() - start:.1f}s")
+
+    elapsed = time.time() - start_time
+    print(f"{domain}: saved {len(result)} embeddings to {output} in {elapsed:.1f}s")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Encode item text with LLM2Vec.")
     parser.add_argument("--data_root", type=str, default="./data")
     parser.add_argument("--domains", type=str, required=True)
-    parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default="McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp",
+        help="Hugging Face model id or local path of the LLM2Vec base model.",
+    )
+    parser.add_argument(
+        "--peft_model_name",
+        type=str,
+        default="McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-unsup-simcse",
+        help="Optional Hugging Face model id or local path of the PEFT adapter.",
+    )
     parser.add_argument("--embedding_tag", type=str, default="llama")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["auto", "float16", "bfloat16", "float32"])
     parser.add_argument("--max_items_per_domain", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -151,7 +205,8 @@ def parse_args():
 
 def main():
     args = parse_args()
-    for domain in [x.strip() for x in args.domains.split(",") if x.strip()]:
+    domains = [x.strip() for x in args.domains.split(",") if x.strip()]
+    for domain in domains:
         encode_domain(args, domain)
 
 
